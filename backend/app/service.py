@@ -143,6 +143,16 @@ def _sniff(blob: bytes) -> str:
     return "unknown"
 
 
+def _freeze_definitions(resolver) -> dict:
+    """拒绝时刻的绑定快照：即使结论被拒绝，已处理符号的最终绑定也须可追查。"""
+    if resolver is None:
+        return {}
+    return {
+        name: {"binding": d.binding, "source": d.source}
+        for name, d in sorted(resolver.defs.items())
+    }
+
+
 def audit(audit_id: str, raw_inputs: list) -> dict:
     """执行完整审计；任何违例抛 AuditRejected。返回可冻结的结论字典。"""
     payloads = validate_request(audit_id, raw_inputs)
@@ -161,6 +171,9 @@ def audit(audit_id: str, raw_inputs: list) -> dict:
             "extraction_order": getattr(resolver, "extraction_log", []),
             "rounds": getattr(resolver, "round_log", []),
             "resolutions": getattr(resolver, "resolutions", []),
+            "symbol_events": getattr(resolver, "symbol_events", []),
+            "definitions": _freeze_definitions(resolver),
+            "weak_unresolved": sorted(getattr(resolver, "weak_undef", {})),
         }
 
     units: List[InputUnit] = []
@@ -226,6 +239,9 @@ def audit(audit_id: str, raw_inputs: list) -> dict:
             "extraction_order": resolver.extraction_log if resolver else [],
             "rounds": resolver.round_log if resolver else [],
             "resolutions": resolver.resolutions if resolver else [],
+            "symbol_events": resolver.symbol_events if resolver else [],
+            "definitions": _freeze_definitions(resolver),
+            "weak_unresolved": sorted(resolver.weak_undef) if resolver else [],
         }
 
     return {

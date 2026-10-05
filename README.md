@@ -11,11 +11,12 @@
 ```
 backend/            FastAPI 服务（无第三方 ELF/ar 库，全部手写字节解析）
   app/elfparser.py  ELF64/ET_REL + GNU ar 解析与严格校验
-  app/linker.py     左至右链接裁决（强/弱/COMMON、归档索引抽取、成组反复扫描）
+  app/linker.py     左至右链接裁决（强/弱/COMMON、归档索引抽取、成组反复扫描、逐符号轨迹）
+  app/tracer.py     冻结结论只读归因（符号清单与单符号轨迹组装，不重放）
   app/service.py    输入校验 + 审计编排（拒绝结论也冻结）
   app/storage.py    SQLite 冻结结论
   app/fixtures.py   纯字节合成 x86-64 ET_REL / GNU ar（演示与测试固件）
-  tests/            解析规则与链接裁决测试（50 例）
+  tests/            解析规则、链接裁决与符号追查测试（65 例）
 frontend/           Vite 原生 JS 页面（真实 API，无框架）
 verify/             一次性验证服务入口
 docker-compose.yml  backend + frontend + verify
@@ -58,7 +59,10 @@ Dockerfile.verify   verify 服务镜像
 | `POST /api/audits` | 提交 `{audit_id, audit_type:"link_closure", inputs:[{name,data_b64,group?}]}` |
 | `GET /api/audits/{audit_id}` | 按标识重开冻结结论 |
 | `GET /api/audits` | 列出冻结标识 |
+| `GET /api/audits/{audit_id}/symbols` | 只读：冻结结论中按处理顺序已出现的符号清单（供详情页选择） |
+| `GET /api/audits/{audit_id}/symbols/{symbol}` | 只读：单符号按命令行处理顺序的归因轨迹 |
 | `GET /api/demo/cycle` | 页面示例：成组后闭合的跨归档循环 |
+| `GET /api/demo/trace` | 页面示例：跨成员满足 + 弱转强覆盖 + 最终未定义归因 |
 
 - 通过：`201`，`status:"accepted"`；
 - 二进制/链接规则拒绝：`422`，`status:"rejected"`，结论**同样冻结**；
@@ -67,8 +71,30 @@ Dockerfile.verify   verify 服务镜像
 
 裁决证据字段：`extraction_order`（序号、归档、成员、命中索引符号、抽取前后
 未定义集合、是否触发错误）、`rounds`（归档逐趟/组逐轮的抽取与未定义集合）、
-`resolutions`、`definitions`、`weak_unresolved`；拒绝时 `error.location`
-为首触发位置，`error.evidence` 含冲突双方或未定义集合。
+`resolutions`、`definitions`、`weak_unresolved`、`symbol_events`（按命令行
+处理顺序冻结的逐符号轨迹）；拒绝时 `error.location` 为首触发位置，
+`error.evidence` 含冲突双方或未定义集合。
+
+## 外部符号归因追查（只读）
+
+重开冻结结论后，详情页可选择该结论中**已出现的符号**，也可手工输入任意
+符号名尝试追查。追查接口只消费随结论冻结的 `symbol_events`，**不重新解析
+输入、不重放裁决、不写存储**，因此不可能改变既有结论、抽取顺序或冻结重放。
+
+每条轨迹事件带：输入位置（`输入#n … .symtab[k]` 或 GNU `/` 符号索引）、
+事件类型（强/弱引用、弱/强/COMMON 定义、归档索引命中/跳过/不收录、拒绝
+证据）、对强未定义集合与绑定结果的影响（`undefined_before/after`、
+`effect`）。轨迹按真实处理顺序排列：
+
+- 归档跨成员满足：`强引用 → archive_index_hit（趟/轮、成员）→ 成员内强定义`，
+  并交叉引用 `extraction_order` 给出实际抽取成员与抽取前后未定义集合；
+- 弱转强覆盖：弱定义事件与覆盖它的强定义事件**同时保留**，弱定义标记
+  `superseded` 并指向最终采用者，强定义标记最终采用者；
+- 拒绝裁决：`DUPLICATE_STRONG` 轨迹止于冲突的第二个强定义，
+  `UNDEFINED_SYMBOL` 止于最终未定义拒绝事件，拒绝点之后**不存在**任何
+  编造事件；
+- 符号未收录（`404 SYMBOL_NOT_IN_VERDICT`）：返回相近名称建议、已收录
+  符号全集与可操作排查步骤。
 
 ## 本地运行
 
@@ -102,7 +128,8 @@ docker compose up --build
 3. 等待 `backend` 健康端点；
 4. HTTP 冒烟：成组循环闭合（accepted）、不成组残留未定义（rejected）、
    重复强定义（DUPLICATE_STRONG，首触发位置）、损坏索引（CORRUPT_BINARY）、
-   冻结与按标识重开（201 → 409 → 200）。
+   符号归因追查（归档跨成员满足、弱转强覆盖、未定义止于拒绝证据、
+   未收录可操作反馈、只读不变性）、冻结与按标识重开（201 → 409 → 200）。
 
 全部通过退出码 `0`，任一失败非零。单独复跑：
 

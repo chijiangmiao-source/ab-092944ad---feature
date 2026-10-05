@@ -184,6 +184,105 @@ def _corrupt_index() -> str:
     return body["error"]["location"]
 
 
+@step("冒烟：符号归因追查（跨成员满足/弱转强/未定义/未收录/只读）")
+def _symbol_trace() -> str:
+    _, demo = _request("GET", "/api/demo/trace")
+    tid = _tag("VERIFY-TRACE"); demo["audit_id"] = tid
+    status, body = _request("POST", "/api/audits", demo)
+    if status != 422 or body["status"] != "rejected":
+        raise AssertionError(f"归因示例应因 missing 未定义拒绝，实际 {status}")
+    if body["error"]["code"] != "UNDEFINED_SYMBOL":
+        raise AssertionError(f"期望 UNDEFINED_SYMBOL，实际 {body['error']}")
+
+    def trace(sym):
+        st, tb = _request("GET", f"/api/audits/{tid}/symbols/{sym}")
+        if st != 200:
+            raise AssertionError(f"追查 {sym} 失败：{st} {tb}")
+        return tb
+
+    # 1) 归档跨成员满足：backsym 经第 2 趟反向抽取 providermem 满足。
+    bt = trace("backsym")
+    btypes = [e["type"] for e in bt["timeline"]]
+    if btypes != ["strong_reference", "archive_index_hit", "strong_definition"]:
+        raise AssertionError(f"backsym 轨迹异常：{btypes}")
+    hit = bt["timeline"][1]
+    if hit["member"] != "providermem.o" or hit["detail"]["pass_or_round"] != 2:
+        raise AssertionError(f"backsym 索引命中证据异常：{hit['member']} pass={hit['detail']}")
+    if bt["archive_extractions"][0]["seq"] != 2:
+        raise AssertionError("backsym 实际抽取成员序号应为 2")
+
+    # 2) 弱转强覆盖：弱定义与强定义并存，最终采用归档成员中的强定义。
+    nt = trace("need")
+    weak = next(e for e in nt["timeline"] if e["type"] == "weak_definition")
+    strong = next(e for e in nt["timeline"] if e["type"] == "strong_definition")
+    if not weak["is_superseded"]:
+        raise AssertionError("弱定义事件必须标记为已被覆盖并保留")
+    if weak["detail"]["adopted_by_event_no"] != strong["event_no"]:
+        raise AssertionError("弱定义必须指向最终采用的强定义事件")
+    if not strong["is_final_binding"] or \
+            strong["effect"] != "strong_overrides_weak":
+        raise AssertionError("强定义必须标注为最终采用者且动作为覆盖弱定义")
+    if nt["final"]["binding"] != "strong" or \
+            "consumermem.o" not in nt["final"]["bound_location"]:
+        raise AssertionError(f"need 最终绑定异常：{nt['final']}")
+    if nt["archive_extractions"][0]["relation"] != "member_defined_symbol":
+        raise AssertionError("need 随 pull 命中的成员装入，关联应为 member_defined_symbol")
+
+    # 3) 未定义符号归因：轨迹止于首个最终未定义拒绝证据。
+    mt = trace("missing")
+    last = mt["timeline"][-1]
+    if last["type"] != "final_undefined_rejection" or not last["is_terminal"]:
+        raise AssertionError(f"missing 轨迹必须止于拒绝证据：{last}")
+    if last["detail"]["undefined"] != ["missing"]:
+        raise AssertionError(f"最终未定义集合异常：{last['detail']}")
+    if any(e["type"] not in (
+        "strong_reference", "archive_index_miss", "final_undefined_rejection"
+    ) for e in mt["timeline"]):
+        raise AssertionError("missing 轨迹不得编造其他事件")
+
+    # 4) 未收录符号：可操作反馈，且不改变冻结结论。
+    before = _request("GET", f"/api/audits/{tid}")[1]
+    st, nf = _request("GET", f"/api/audits/{tid}/symbols/ghost%20sentinel")
+    if st != 404 or nf.get("error", {}).get("code") != "SYMBOL_NOT_IN_VERDICT":
+        raise AssertionError(f"未收录反馈异常：{st} {nf}")
+    if not nf.get("action", {}).get("steps"):
+        raise AssertionError("未收录反馈必须包含可操作建议")
+    if "need" not in nf["action"]["recorded_symbols"]:
+        raise AssertionError("未收录反馈必须回列已收录符号")
+    st, near = _request("GET", f"/api/audits/{tid}/symbols/nee")
+    if st != 404 or "need" not in near["error"]["evidence"]["closest_matches"]:
+        raise AssertionError("近似符号名应给出相近匹配建议")
+    after = _request("GET", f"/api/audits/{tid}")[1]
+    if after != before:
+        raise AssertionError("追查查询改变了冻结结论（违反只读要求）")
+
+    # 5) 重复强定义：轨迹止于首个冲突证据，后续输入事件不得出现。
+    sys.path.insert(0, str(BACKEND))
+    from app.fixtures import ObjSpec as _OS, b64 as _b64, build_elf64_rel as _b
+    dup = {
+        "audit_id": _tag("VERIFY-DUPTRACE"),
+        "inputs": [
+            {"name": "m.o", "data_b64": _b64(_b(_OS("m", undefined=["d"])))},
+            {"name": "x.o", "data_b64": _b64(_b(_OS("x", strong=["d"])))},
+            {"name": "y.o", "data_b64": _b64(_b(_OS("y", strong=["d"])))},
+            {"name": "z.o", "data_b64": _b64(_b(_OS("z", strong=["later"])))},
+        ],
+    }
+    _, db = _request("POST", "/api/audits", dup)
+    dt = _request("GET", f"/api/audits/{dup['audit_id']}/symbols/d")[1]
+    dtypes = [e["type"] for e in dt["timeline"]]
+    if dtypes != ["strong_reference", "strong_definition",
+                  "duplicate_strong_definition"]:
+        raise AssertionError(f"重复强定义轨迹异常：{dtypes}")
+    if not dt["timeline"][-1]["is_terminal"]:
+        raise AssertionError("重复强定义轨迹必须止于冲突事件")
+    if any(e["symbol"] == "later" for e in db["symbol_events"]):
+        raise AssertionError("拒绝后不得编造后续输入事件")
+
+    return ("backsym 第2趟跨成员满足；need 弱→强覆盖；missing 止于拒绝证据；"
+            "未收录可操作反馈；结论只读不变")
+
+
 @step("冒烟：冻结结论按标识重开（GET 409→200）")
 def _freeze_reopen() -> str:
     _, demo = _request("GET", "/api/demo/cycle")
@@ -211,6 +310,7 @@ def main() -> int:
     _ungrouped_cycle()
     _duplicate_strong()
     _corrupt_index()
+    _symbol_trace()
     _freeze_reopen()
 
     print("\n================ verify 汇总 ================")

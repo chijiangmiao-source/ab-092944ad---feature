@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from .service import AuditRejected, audit
 from .fixtures import ObjSpec, b64, build_elf64_rel, build_gnu_ar
 from .storage import AuditStore
+from .tracer import TraceRequestError, list_frozen_symbols, trace_symbol
 
 DB_PATH = os.environ.get("AUDIT_DB", "/data/audits.db")
 
@@ -76,6 +77,49 @@ def demo_cycle() -> dict:
     }
 
 
+@app.get("/api/demo/trace")
+def demo_trace() -> dict:
+    """页面「符号归因示例」的真实输入集（合成 x86-64 ET_REL/ar 字节）。
+
+    命令行顺序（均不成组）：
+      main.o : 强引用 need、pull、missing；弱引用 wref
+      weak.o : need 的弱定义（占位；按 ld 语义弱定义不会触发归档抽取）
+      lib1.a : 成员顺序 providermem、consumermem
+        providermem : 强定义 backsym
+        consumermem : 强定义 pull、need，引用 backsym
+
+    lib1.a 第 1 趟：providermem 无命中（backsym 尚无未定义引用）；
+    consumermem 因 pull 命中被抽取，其强定义 need 覆盖 weak.o 的弱定义，
+    并引入 backsym 未定义。第 2 趟反向抽取 providermem 跨成员满足 backsym；
+    missing 索引始终不收录，最终未定义拒绝。
+    """
+    obj = lambda s: {"name": s.name + ".o",
+                     "data_b64": b64(build_elf64_rel(s))}
+    arc = lambda nm, specs: {
+        "name": nm + ".a", "data_b64": b64(build_gnu_ar(nm, specs)),
+    }
+    return {
+        "audit_id": "MAINT-TRACE-DEMO-0001",
+        "inputs": [
+            obj(ObjSpec("main", undefined=["need", "pull", "missing"],
+                        weak_undefined=["wref"])),
+            obj(ObjSpec("weakplaceholder", weak=["need"])),
+            arc("lib1", [
+                ObjSpec("providermem", strong=["backsym"]),
+                ObjSpec("consumermem",
+                        strong=["pull", "need"], undefined=["backsym"]),
+            ]),
+        ],
+        "trace_focus": ["need", "pull", "backsym", "missing"],
+        "explanation": (
+            "need：弱定义占位→consumermem 因 pull 命中被抽取，强定义 need 覆盖弱定义；"
+            "pull：强引用→归档索引命中→成员抽取→强定义满足的完整链路；"
+            "backsym：consumermem 引用，第 2 趟反向抽取 providermem 跨成员满足；"
+            "missing：索引不收录，最终未定义拒绝；wref：弱引用残留不判错"
+        ),
+    }
+
+
 @app.get("/api/audits")
 def list_audits() -> dict:
     return {"audits": store.list_ids()}
@@ -97,6 +141,66 @@ def reopen(audit_id: str) -> JSONResponse:
             },
         )
     return JSONResponse(content=verdict)
+
+
+@app.get("/api/audits/{audit_id}/symbols")
+def audit_symbols(audit_id: str) -> JSONResponse:
+    """只读：列出冻结结论中按处理顺序已出现的外部符号供详情页选择。
+
+    不解析输入、不重放裁决、不写存储，仅消费冻结结论中的轨迹证据。
+    """
+    verdict = store.get(audit_id)
+    if verdict is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "error": {
+                    "code": "NOT_FOUND",
+                    "message": f"审计标识 {audit_id!r} 尚无冻结结论",
+                    "location": "path",
+                },
+            },
+        )
+    return JSONResponse(content=list_frozen_symbols(verdict))
+
+
+@app.get("/api/audits/{audit_id}/symbols/{symbol:path}")
+def audit_symbol_trace(audit_id: str, symbol: str) -> JSONResponse:
+    """只读：按命令行处理顺序返回某符号的引用/弱定义/强定义/归档索引命中/
+    实际抽取成员的归因轨迹。
+
+    轨迹完全来自冻结证据：强覆盖弱时两者并存并标明最终采用者；
+    DUPLICATE_STRONG / 最终未定义拒绝时轨迹止于首个拒绝证据；
+    符号未被该冻结结论收录时返回可操作的未收录反馈。
+    """
+    verdict = store.get(audit_id)
+    if verdict is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "error": {
+                    "code": "NOT_FOUND",
+                    "message": f"审计标识 {audit_id!r} 尚无冻结结论",
+                    "location": "path",
+                },
+            },
+        )
+    try:
+        result = trace_symbol(verdict, symbol)
+    except TraceRequestError as exc:
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={
+                "status": "error",
+                "error": {"code": exc.code, "message": exc.message,
+                          "location": "query.symbol"},
+            },
+        )
+    if not result.get("found"):
+        return JSONResponse(status_code=404, content=result)
+    return JSONResponse(content=result)
 
 
 @app.post("/api/audits")

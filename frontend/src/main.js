@@ -225,7 +225,9 @@ function renderVerdict(v, { frozen = false, reopened = false } = {}) {
   if ((v.weak_unresolved ?? []).length) {
     html += `<h3>弱未定义（不判错）</h3><div class="undef-set">${v.weak_unresolved.map(escapeHtml).join(', ')}</div>`;
   }
+  html += renderTracePanelSkeleton(v.audit_id);
   verdictEl.innerHTML = html;
+  initTracePanel(v.audit_id);
 }
 
 function renderInputs(inputs) {
@@ -303,10 +305,293 @@ function renderDefinitions(defs) {
 }
 
 // --------------------------------------------------------------------------- //
+// ④ 符号归因追查（只读真实接口，不重放、不改写冻结结论）
+// --------------------------------------------------------------------------- //
+let traceBusy = false;
+
+function renderTracePanelSkeleton(auditId) {
+  return `
+  <div class="trace-panel" id="tracePanel" data-audit="${escapeAttr(auditId)}">
+    <h3>④ 外部符号归因追查（只读）</h3>
+    <div class="trace-hint">选择冻结结论中已出现的符号，按<strong>命令行处理顺序</strong>
+      追溯其引用、弱/强定义、归档索引命中与实际抽取成员；每项含输入位置及对未定义集合/绑定的影响。
+      追查仅读取冻结证据，不改变结论、抽取顺序或冻结重放。</div>
+    <div class="trace-controls">
+      <select id="traceSelect" class="trace-select">
+        <option value="">— 加载已收录符号中 —</option>
+      </select>
+      <input type="text" id="traceCustom" class="trace-custom"
+             placeholder="或输入任意符号名尝试追查（未收录会给出反馈）"
+             autocomplete="off" spellcheck="false" />
+      <button id="traceQueryBtn" class="btn small" type="button">追查</button>
+    </div>
+    <div id="traceResult" class="trace-result">
+      <div class="empty">请选择一个已收录符号开始追查</div>
+    </div>
+  </div>`;
+}
+
+const FINAL_STATE_BADGE = {
+  bound_strong: ['最终采用强定义', 'strong'],
+  bound_weak: ['最终仅弱定义（占位）', 'weak'],
+  bound_common: ['最终采用 COMMON 暂定定义', 'common'],
+  final_undefined: ['最终未定义 · 裁决拒绝', 'err'],
+  duplicate_strong_rejected: ['重复强定义 · 裁决拒绝', 'err'],
+  weak_unresolved: ['弱未定义残留（不判错）', 'weak'],
+  no_effect_binding: ['未形成绑定', ''],
+};
+
+function initTracePanel(auditId) {
+  const select = document.getElementById('traceSelect');
+  const custom = document.getElementById('traceCustom');
+  const btn = document.getElementById('traceQueryBtn');
+  const result = document.getElementById('traceResult');
+  if (!select) return;
+
+  fetch(`/api/audits/${encodeURIComponent(auditId)}/symbols`)
+    .then((r) => r.json())
+    .then((listing) => {
+      if (!listing.symbols) throw new Error('符号清单响应异常');
+      select.innerHTML = '<option value="">— 请选择已收录符号 —</option>';
+      const groups = new Map();
+      for (const s of listing.symbols) {
+        const [label] = FINAL_STATE_BADGE[s.final_state] || [s.final_state];
+        if (!groups.has(label)) groups.set(label, []);
+        groups.get(label).push(s);
+      }
+      for (const [label, items] of groups) {
+        const og = document.createElement('optgroup');
+        og.label = `${label}（${items.length}）`;
+        items.forEach((s) => {
+          const o = document.createElement('option');
+          o.value = s.symbol;
+          o.textContent = `${s.symbol} · ${s.event_count} 个事件`;
+          og.appendChild(o);
+        });
+        select.appendChild(og);
+      }
+      result.innerHTML = `<div class="empty">已收录 ${listing.count} 个符号，请选择或输入符号名后追查</div>`;
+    })
+    .catch((e) => {
+      select.innerHTML = '<option value="">— 符号清单不可用 —</option>';
+      result.innerHTML = `<div class="empty">符号清单加载失败：${escapeHtml(e.message)}</div>`;
+    });
+
+  select.addEventListener('change', () => {
+    if (select.value) {
+      custom.value = '';
+      queryTrace(auditId, select.value);
+    }
+  });
+  btn.addEventListener('click', () => {
+    const name = custom.value.trim();
+    if (!name) {
+      if (select.value) queryTrace(auditId, select.value);
+      return;
+    }
+    queryTrace(auditId, name);
+  });
+  custom.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') btn.click();
+  });
+}
+
+async function queryTrace(auditId, name) {
+  const result = document.getElementById('traceResult');
+  if (traceBusy) return;
+  traceBusy = true;
+  result.innerHTML = `<div class="empty">GET /api/audits/${escapeHtml(auditId)}/symbols/${escapeHtml(name)} …</div>`;
+  try {
+    const res = await fetch(
+      `/api/audits/${encodeURIComponent(auditId)}/symbols/${encodeURIComponent(name)}`
+    );
+    const body = await res.json();
+    if (res.status === 404 && body.found === false) {
+      renderNotRecorded(body);
+    } else if (res.status >= 400) {
+      result.innerHTML = `<div class="empty">${escapeHtml(body.error?.message ?? '追查失败')}</div>`;
+    } else {
+      renderTrace(body);
+    }
+  } catch (e) {
+    result.innerHTML = `<div class="empty">网络错误：${escapeHtml(e.message)}</div>`;
+  } finally {
+    traceBusy = false;
+  }
+}
+
+function renderNotRecorded(body) {
+  const result = document.getElementById('traceResult');
+  const err = body.error ?? {};
+  const ev = err.evidence ?? {};
+  const action = body.action ?? {};
+  const chips = (names) => names.map((n) =>
+    `<button type="button" class="chip" data-symbol="${escapeAttr(n)}">${escapeHtml(n)}</button>`
+  ).join('') || '<span class="muted-s">（无）</span>';
+  result.innerHTML = `
+    <div class="trace-notfound">
+      <div class="nf-head">⊘ 未收录符号：<span class="mono">${escapeHtml(body.symbol)}</span></div>
+      <div class="nf-msg">${escapeHtml(err.message)}</div>
+      ${(ev.closest_matches ?? []).length
+        ? `<div class="nf-row"><span class="nf-k">名称相近：</span>${chips(ev.closest_matches)}</div>`
+        : '<div class="nf-row"><span class="nf-k">名称相近：</span><span class="muted-s">无匹配</span></div>'}
+      <div class="nf-row"><span class="nf-k">可操作建议：</span>
+        <ul class="nf-steps">${(action.steps ?? []).map((s) => `<li>${escapeHtml(s)}</li>`).join('')}</ul></div>
+      <details><summary>该冻结结论收录的全部 ${ev.recorded_symbol_count ?? 0} 个符号</summary>
+        <div class="nf-chips">${chips(action.recorded_symbols ?? [])}</div></details>
+    </div>`;
+  result.querySelectorAll('.chip').forEach((c) => {
+    c.addEventListener('click', () => {
+      const sel = document.getElementById('traceSelect');
+      if ([...sel.options].some((o) => o.value === c.dataset.symbol)) {
+        sel.value = c.dataset.symbol;
+      } else {
+        document.getElementById('traceCustom').value = c.dataset.symbol;
+      }
+      queryTrace(body.audit_id, c.dataset.symbol);
+    });
+  });
+}
+
+const TYPE_LABEL = {
+  strong_reference: '强引用',
+  weak_reference: '弱引用',
+  common_reference: 'COMMON 引用',
+  weak_definition: '弱定义',
+  strong_definition: '强定义',
+  common_definition: 'COMMON 定义',
+  duplicate_strong_definition: '重复强定义',
+  archive_index_hit: '归档索引命中',
+  archive_index_skip: '索引命中但成员已抽取',
+  archive_index_miss: '归档索引不收录',
+  final_undefined_rejection: '最终未定义拒绝',
+};
+
+function renderTrace(t) {
+  const result = document.getElementById('traceResult');
+  const [stateLabel, stateCls] = FINAL_STATE_BADGE[t.final.state] ?? [t.final.state, ''];
+  const c = t.counts ?? {};
+  let html = `
+    <div class="trace-head">
+      <div class="trace-sym mono">${escapeHtml(t.symbol)}</div>
+      ${tag(stateLabel, stateCls)}
+      <span class="readonly-pill">❄ 只读 · 冻结证据</span>
+    </div>`;
+  if (t.final.bound_location) {
+    html += `<div class="trace-bound">最终绑定位置：<span class="mono">${escapeHtml(t.final.bound_location)}</span></div>`;
+  }
+  html += `<div class="trace-counts">
+    <span>强引用 ${c.strong_references ?? 0}</span>
+    <span>弱引用 ${c.weak_references ?? 0}</span>
+    <span>弱定义 ${c.weak_definitions ?? 0}</span>
+    <span>强定义 ${c.strong_definitions ?? 0}</span>
+    <span>索引命中 ${c.archive_index_hits ?? 0}</span>
+    <span>实际抽取成员 ${c.archive_members_extracted ?? 0}</span>
+  </div>`;
+  html += renderTraceExtractions(t.archive_extractions ?? []);
+  html += '<div class="trace-timeline">';
+  for (const e of t.timeline) {
+    html += renderTraceEvent(e);
+  }
+  html += '</div>';
+  result.innerHTML = html;
+}
+
+function renderTraceExtractions(list) {
+  if (!list.length) return '';
+  const rows = list.map((x) => `
+    <tr>
+      <td class="mono">#${x.seq}</td>
+      <td class="mono">输入#${x.input_position} ${escapeHtml(x.archive)}!${escapeHtml(x.member)}</td>
+      <td>${x.relation === 'index_hit_for_symbol'
+        ? tag('该符号索引命中', 'ok')
+        : tag('成员内定义该符号', 'weak')}</td>
+      <td class="mono">${escapeHtml((x.matched_index_symbols ?? []).join(', ') || '—')}</td>
+      <td class="undef-set">{${(x.undefined_before ?? []).join(', ')}}</td>
+      <td class="undef-set">{${(x.undefined_after ?? []).join(', ')}}</td>
+    </tr>`).join('');
+  return `<div class="trace-sub">实际抽取成员（与冻结 extraction_order 交叉引用）</div>
+  <div class="scroll"><table>
+    <tr><th>序号</th><th>成员</th><th>关联</th><th>命中索引符号</th><th>抽取前未定义</th><th>抽取后未定义</th></tr>
+    ${rows}
+  </table></div>`;
+}
+
+function renderTraceEvent(e) {
+  const cat = TYPE_LABEL[e.type] ?? e.type;
+  let cls = 'ev-other';
+  if (e.type.endsWith('_reference') || e.type === 'common_reference') cls = 'ev-ref';
+  if (e.type.includes('definition') && !e.type.includes('duplicate')) cls = 'ev-def';
+  if (e.type.startsWith('archive_index')) cls = 'ev-idx';
+  if (e.is_terminal) cls = 'ev-reject';
+  const badges = [];
+  if (e.is_terminal) badges.push('<span class="mini-badge reject-b">拒绝终点 · 后续事件不存在</span>');
+  if (e.is_final_binding) badges.push('<span class="mini-badge final-b">最终采用者</span>');
+  if (e.is_superseded) badges.push('<span class="mini-badge sup-b">已被强定义覆盖（保留留档）</span>');
+  const undef = (e.undefined_before !== null && e.undefined_before !== undefined)
+    ? `<div class="ev-undef">未定义集合 <span class="undef-set">{${(e.undefined_before ?? []).join(', ')}}</span>
+         → <span class="undef-set">{${(e.undefined_after ?? []).join(', ')}}</span></div>`
+    : '';
+  let detail = '';
+  if (e.type === 'strong_definition' && e.effect === 'strong_overrides_weak') {
+    detail = `<div class="ev-detail">被覆盖的弱定义：<span class="mono">${escapeHtml(e.detail.replaced_location)}</span>（事件 #${e.detail.replaces_event_no}）</div>`;
+  }
+  if (e.is_superseded && e.detail.adopted_by_location) {
+    detail += `<div class="ev-detail">最终采用：<span class="mono">${escapeHtml(e.detail.adopted_by_location)}</span>（事件 #${e.detail.adopted_by_event_no}）</div>`;
+  }
+  if (e.type === 'duplicate_strong_definition') {
+    detail = `<div class="ev-detail">首个强定义：<span class="mono">${escapeHtml(e.detail.first_definition)}</span><br/>
+      冲突强定义：<span class="mono">${escapeHtml(e.detail.conflicting_definition)}</span></div>`;
+  }
+  if (e.type === 'final_undefined_rejection') {
+    detail = `<div class="ev-detail">首次引用：<span class="mono">${escapeHtml(e.detail.first_reference)}</span><br/>
+      最终未定义集合：<span class="undef-set">{${(e.detail.undefined ?? []).join(', ')}}</span></div>`;
+  }
+  if (e.extraction_seq) {
+    detail += `<div class="ev-detail">触发成员抽取序号：#${e.extraction_seq}</div>`;
+  }
+  return `
+  <div class="trace-event ${cls}${e.is_terminal ? ' terminal' : ''}">
+    <div class="ev-top">
+      <span class="ev-no mono">#${e.event_no}</span>
+      ${tag(cat, '')}
+      <span class="ev-context mono">${escapeHtml(
+        e.type === 'final_undefined_rejection'
+          ? '命令行处理完毕 · 裁决终结'
+          : [e.input_position ? `输入#${e.input_position} ${e.input_name ?? ''}` : '',
+             e.member ? `!${e.member}` : ''].join('')
+      )}</span>
+      ${badges.join('')}
+    </div>
+    <div class="ev-loc mono">${escapeHtml(e.location)}</div>
+    <div class="ev-text">${escapeHtml(e.effect_text)}</div>
+    ${undef}${detail}
+  </div>`;
+}
+
+async function fillTraceDemo() {
+  clearRequestError();
+  setBusy(true, 'GET /api/demo/trace …');
+  try {
+    const res = await fetch('/api/demo/trace');
+    const demo = await res.json();
+    auditIdEl.value = demo.audit_id;
+    rowsEl.innerHTML = '';
+    demo.inputs.forEach((i) => addRow({ name: i.name, group: i.group ?? '', data: i.data_b64 }));
+    verdictEl.innerHTML = `<div class="empty">已填充${demo.inputs.length}个真实合成输入（${escapeHtml(demo.explanation)}）。点击「提交审计」，再在结论下方用符号面板追查 need / pull / backsym / missing。</div>`;
+  } catch (e) {
+    showRequestError(`示例加载失败：${e.message}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+// --------------------------------------------------------------------------- //
 document.getElementById('submitBtn').addEventListener('click', submitAudit);
 document.getElementById('reopenBtn').addEventListener('click', reopenAudit);
 document.getElementById('addRow').addEventListener('click', () => addRow());
 document.getElementById('addDemo').addEventListener('click', fillDemo);
+document.getElementById('addTraceDemo').addEventListener('click', fillTraceDemo);
 
 addRow();
 verdictEl.innerHTML = '<div class="empty">填写标识与输入，或点击「填充循环依赖示例」</div>';
