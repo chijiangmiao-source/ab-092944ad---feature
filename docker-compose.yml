@@ -1,0 +1,47 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    image: link-audit-backend:latest
+    container_name: link-audit-backend
+    environment:
+      AUDIT_DB: /data/audits.db
+    volumes:
+      - audit-data:/data
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2); assert json.load(r)['status']=='ok'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    image: link-audit-frontend:latest
+    container_name: link-audit-frontend
+    ports:
+      - "8080:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 一次性验证服务：解析规则测试 + 前端构建检查 + 归档闭合 API/HTTP 冒烟。
+  # 随 `docker compose up --build` 一次运行并以退出码报告；
+  # 只需复跑时：`docker compose run --rm verify`。
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile.verify
+    image: link-audit-verify:latest
+    container_name: link-audit-verify
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  audit-data:

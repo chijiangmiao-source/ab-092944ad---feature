@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>机载维护镜像 · 链接闭合审计</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">⬢</span>
+        <div>
+          <h1>机载维护镜像 · 链接闭合审计</h1>
+          <p class="sub">ELF64 ET_REL 与 GNU ar 归档 · 小端 x86-64 · 离线装载前链接闭包校验</p>
+        </div>
+      </div>
+      <span class="badge">字节级边界校验</span>
+    </header>
+
+    <main class="layout">
+      <section class="card">
+        <h2>① 稳定审计标识</h2>
+        <div class="id-row">
+          <input id="auditId" type="text" placeholder="例如 MAINT-AUDIT-2026-0001"
+                 maxlength="64" autocomplete="off" spellcheck="false" />
+          <button id="reopenBtn" class="btn ghost" type="button">按标识重开冻结结论</button>
+        </div>
+
+        <h2>② 按命令行顺序排列的输入（至多 12 个）</h2>
+        <div class="input-head">
+          <span>位置 · 名称 · 成组标签（可选） · Base64 数据</span>
+          <span>
+            <button id="addRow" class="btn small" type="button">＋ 新增一行</button>
+            <button id="addDemo" class="btn small ghost" type="button">填充循环依赖示例</button>
+          </span>
+        </div>
+        <div id="rows"></div>
+
+        <div class="actions">
+          <button id="submitBtn" class="btn primary" type="button">提交审计</button>
+          <span id="loadHint"></span>
+        </div>
+        <div id="requestError" class="error-banner" hidden></div>
+      </section>
+
+      <section class="card verdict-card">
+        <h2>③ 裁决与证据</h2>
+        <div id="verdict"></div>
+      </section>
+    </main>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
