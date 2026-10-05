@@ -147,7 +147,7 @@ def audit(audit_id: str, raw_inputs: list) -> dict:
     """执行完整审计；任何违例抛 AuditRejected。返回可冻结的结论字典。"""
     payloads = validate_request(audit_id, raw_inputs)
 
-    def reject_verdict(exc: AuditRejected) -> dict:
+    def link_reject_dict(exc: LinkError) -> dict:
         return {
             "audit_id": audit_id,
             "status": "rejected",
@@ -158,9 +158,10 @@ def audit(audit_id: str, raw_inputs: list) -> dict:
                 "evidence": exc.evidence,
             },
             "inputs": input_records,
-            "extraction_order": getattr(resolver, "extraction_log", []),
-            "rounds": getattr(resolver, "round_log", []),
-            "resolutions": getattr(resolver, "resolutions", []),
+            "extraction_order": resolver.extraction_log if resolver else [],
+            "rounds": resolver.round_log if resolver else [],
+            "resolutions": resolver.resolutions if resolver else [],
+            **(resolver.symbol_trace_payload() if resolver else {}),
         }
 
     units: List[InputUnit] = []
@@ -211,8 +212,6 @@ def audit(audit_id: str, raw_inputs: list) -> dict:
         resolver = Resolver(units=units)
         result = resolver.run()
     except AuditRejected as exc:
-        return reject_verdict(exc)
-    except LinkError as exc:
         return {
             "audit_id": audit_id,
             "status": "rejected",
@@ -223,10 +222,12 @@ def audit(audit_id: str, raw_inputs: list) -> dict:
                 "evidence": exc.evidence,
             },
             "inputs": input_records,
-            "extraction_order": resolver.extraction_log if resolver else [],
-            "rounds": resolver.round_log if resolver else [],
-            "resolutions": resolver.resolutions if resolver else [],
+            "extraction_order": getattr(resolver, "extraction_log", []),
+            "rounds": getattr(resolver, "round_log", []),
+            "resolutions": getattr(resolver, "resolutions", []),
         }
+    except LinkError as exc:
+        return link_reject_dict(exc)
 
     return {
         "audit_id": audit_id,
@@ -234,4 +235,5 @@ def audit(audit_id: str, raw_inputs: list) -> dict:
         "error": None,
         "inputs": input_records,
         **result,
+        **resolver.symbol_trace_payload(),
     }

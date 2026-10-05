@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from .service import AuditRejected, audit
 from .fixtures import ObjSpec, b64, build_elf64_rel, build_gnu_ar
 from .storage import AuditStore
+from .trace import TraceNotFound, get_trace, list_symbols
 
 DB_PATH = os.environ.get("AUDIT_DB", "/data/audits.db")
 
@@ -76,6 +77,47 @@ def demo_cycle() -> dict:
     }
 
 
+@app.get("/api/demo/symbol-trace")
+def demo_symbol_trace() -> dict:
+    """页面「符号轨迹示例」的真实输入集。
+
+    一个冻结结论中同时包含三类可追查归因：
+
+    * b：main 引用 a → libdep.a 索引命中抽取 amem → amem 引用 b →
+      同归档索引命中 bmem → 实际抽取 bmem 并以强定义满足（归档跨成员满足）；
+    * w：main 引用 → weakprov.o 弱定义占位 → strongprov.o 强定义覆盖，
+      轨迹同时保留弱、强两者并标明最终采用强定义；
+    * ghost：仅被 main 引用，任何成员/索引都不能满足，
+      裁决以 UNDEFINED_SYMBOL 拒绝，轨迹止于首个拒绝证据。
+    """
+    obj = lambda s: {"name": s.name + ".o", "data_b64": b64(build_elf64_rel(s))}
+    arc = lambda nm, specs: {
+        "name": nm + ".a", "data_b64": b64(build_gnu_ar(nm, specs)),
+    }
+    return {
+        "audit_id": "MAINT-TRACE-DEMO-0001",
+        "inputs": [
+            obj(ObjSpec("main", undefined=["a", "w", "ghost"])),
+            obj(ObjSpec("weakprov", weak=["w"])),
+            obj(ObjSpec("strongprov", strong=["w"])),
+            arc("libdep", [
+                ObjSpec("amem", strong=["a"], undefined=["b"]),
+                ObjSpec("bmem", strong=["b"]),
+            ]),
+        ],
+        "explanation": (
+            "a 抽取 amem 后引出 b，归档内继续抽取 bmem 跨成员满足；"
+            "w 弱定义被后到强定义覆盖（两者均保留）；"
+            "ghost 最终未定义，裁决被拒绝"
+        ),
+        "focus_symbols": {
+            "cross_member": "b",
+            "weak_to_strong": "w",
+            "undefined": "ghost",
+        },
+    }
+
+
 @app.get("/api/audits")
 def list_audits() -> dict:
     return {"audits": store.list_ids()}
@@ -97,6 +139,59 @@ def reopen(audit_id: str) -> JSONResponse:
             },
         )
     return JSONResponse(content=verdict)
+
+
+@app.get("/api/audits/{audit_id}/symbols")
+def list_audit_symbols(audit_id: str) -> JSONResponse:
+    """列出冻结结论中已收录、可追查的外部符号（详情页选择用）。只读。"""
+    verdict = store.get(audit_id)
+    if verdict is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "error": {
+                    "code": "NOT_FOUND",
+                    "message": f"审计标识 {audit_id!r} 尚无冻结结论",
+                    "location": "path",
+                },
+            },
+        )
+    return JSONResponse(content=list_symbols(verdict))
+
+
+@app.get("/api/audits/{audit_id}/symbols/{symbol}")
+def audit_symbol_trace(audit_id: str, symbol: str) -> JSONResponse:
+    """按命令行处理顺序返回某符号在冻结结论中的完整轨迹。只读、不重放。"""
+    verdict = store.get(audit_id)
+    if verdict is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "error": {
+                    "code": "NOT_FOUND",
+                    "message": f"审计标识 {audit_id!r} 尚无冻结结论",
+                    "location": "path",
+                },
+            },
+        )
+    try:
+        body, status = get_trace(verdict, symbol)
+    except TraceNotFound as exc:
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={
+                "status": "error",
+                "error": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "location": "symbol",
+                    "available_symbols": exc.alternatives,
+                },
+            },
+        )
+    return JSONResponse(status_code=status, content=body)
 
 
 @app.post("/api/audits")

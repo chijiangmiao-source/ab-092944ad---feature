@@ -3,7 +3,8 @@
 
 1. 解析规则测试（pytest，覆盖 ELF/ar 字节级校验）；
 2. 前端构建检查（vite build）；
-3. 归档闭合 API/HTTP 冒烟（健康端点、提交、拒绝、冻结重开）。
+3. 归档闭合 API/HTTP 冒烟（健康端点、提交、拒绝、冻结重开）；
+4. 逐符号轨迹只读冒烟（跨成员满足 / 弱转强 / 未定义 / 未收录 404 / 不改结论）。
 
 任一步失败即以非零退出码结束，并在最后打印汇总。
 """
@@ -202,6 +203,86 @@ def _freeze_reopen() -> str:
     return "201 → 409(冻结) → 200(重开)"
 
 
+@step("冒烟：逐符号轨迹（跨成员满足/弱转强/未定义归因/未收录反馈/只读）")
+def _symbol_trace() -> str:
+    _, demo = _request("GET", "/api/demo/symbol-trace")
+    fid = _tag("VERIFY-TRACE"); demo["audit_id"] = fid
+    status, body = _request("POST", "/api/audits", demo)
+    if status != 422 or body["error"]["code"] != "UNDEFINED_SYMBOL":
+        raise AssertionError(f"轨迹示例应因 ghost 未定义被 422 拒绝，实际 {status} {body.get('error',{}).get('code')}")
+
+    # 可追查符号列表来自真实只读接口
+    s, lst = _request("GET", f"/api/audits/{fid}/symbols")
+    if s != 200:
+        raise AssertionError(f"符号列表应 200，实际 {s}")
+    listed = {x["symbol"] for x in lst["symbols"]}
+    if not {"a", "b", "w", "ghost"} <= listed:
+        raise AssertionError(f"符号列表缺少焦点符号：{listed}")
+
+    def types_of(sym):
+        sc, tr = _request("GET", f"/api/audits/{fid}/symbols/{sym}")
+        if sc != 200:
+            raise AssertionError(f"符号 {sym} 轨迹应 200，实际 {sc}")
+        t = tr["trace"]
+        return t, [e["type"] for e in t["events"]]
+
+    # 1) 归档跨成员满足：引用 → 索引命中 → 实际抽取 → 强定义
+    tb, btypes = types_of("b")
+    if btypes != ["strong_reference", "archive_index_hit",
+                  "member_extracted", "strong_definition"]:
+        raise AssertionError(f"b 跨成员归因事件序列不符：{btypes}")
+    hit = next(e for e in tb["events"] if e["type"] == "archive_index_hit")
+    if hit["archive"] != "libdep.a" or hit["member"] != "bmem.o":
+        raise AssertionError(f"b 的索引命中位置错误：{hit.get('archive')} {hit.get('member')}")
+    if not all(e.get("location") and e.get("effect") for e in tb["events"]):
+        raise AssertionError("b 轨迹存在缺少输入位置或影响说明的事件")
+    if not tb["adopted_definition"]["source"].endswith("bmem.o"):
+        raise AssertionError("b 最终采用定义应来自 bmem.o")
+
+    # 2) 弱转强覆盖：弱定义与强定义同时保留，最终采用强定义
+    tw, wtypes = types_of("w")
+    if wtypes != ["strong_reference", "weak_definition", "strong_definition"]:
+        raise AssertionError(f"w 弱转强事件序列不符：{wtypes}")
+    ov = tw["events"][-1]
+    if ov["binding_before"] != "weak" or ov["binding_after"] != "strong":
+        raise AssertionError("w 覆盖事件绑定前后状态错误")
+    if "weakprov.o" not in ov["previous_binding_source"] \
+            or not ov["adopted_source"].endswith("strongprov.o"):
+        raise AssertionError("w 轨迹未同时保留弱定义来源与强定义采用者")
+    if tw["adopted_definition"]["binding"] != "strong":
+        raise AssertionError("w 最终绑定应为 strong")
+
+    # 3) 未定义符号归因：轨迹止于首个拒绝证据，不编造后续事件
+    tg, gtypes = types_of("ghost")
+    if gtypes != ["strong_reference", "final_undefined"]:
+        raise AssertionError(f"ghost 归因事件序列不符：{gtypes}")
+    term = tg["events"][-1]
+    if not term.get("terminal") or term["rejection"]["code"] != "UNDEFINED_SYMBOL":
+        raise AssertionError("ghost 轨迹未止于 UNDEFINED_SYMBOL 拒绝证据")
+    if tg["terminal"]["code"] != "UNDEFINED_SYMBOL" or tg["adopted_definition"] is not None:
+        raise AssertionError("ghost 终态信息错误")
+
+    # 4) 未收录符号：可操作反馈 + 已收录候选
+    sn, nf = _request("GET", f"/api/audits/{fid}/symbols/not_in_verdict_xyz")
+    if sn != 404 or nf["error"]["code"] != "SYMBOL_NOT_RECORDED":
+        raise AssertionError(f"未收录符号应 404 SYMBOL_NOT_RECORDED，实际 {sn} {nf.get('error',{}).get('code')}")
+    if "not_in_verdict_xyz" not in nf["error"]["message"]:
+        raise AssertionError("未收录反馈未给出可操作说明")
+    if not {"a", "b", "w", "ghost"} <= set(nf["error"]["available_symbols"]):
+        raise AssertionError("未收录反馈缺少已收录符号候选")
+
+    # 5) 查询不得改变冻结结论/抽取顺序
+    _, before = _request("GET", f"/api/audits/{fid}")
+    for sym in ("b", "w", "ghost", "missing_symbol"):
+        _request("GET", f"/api/audits/{fid}/symbols/{sym}")
+    _, after = _request("GET", f"/api/audits/{fid}")
+    if before != after:
+        raise AssertionError("轨迹只读查询改变了冻结结论")
+
+    return (f"b:{btypes[1]}→{btypes[2]}；w 弱→强({ov['adopted_source'].split()[-1]})；"
+            f"ghost 止于 {term['rejection']['code']}；未收录 404；查询只读")
+
+
 def main() -> int:
     # 测试与构建不依赖后端，先跑；冒烟前等待健康端点。
     _parser_tests()
@@ -212,6 +293,7 @@ def main() -> int:
     _duplicate_strong()
     _corrupt_index()
     _freeze_reopen()
+    _symbol_trace()
 
     print("\n================ verify 汇总 ================")
     width = max(len(n) for n, _, _ in results)
